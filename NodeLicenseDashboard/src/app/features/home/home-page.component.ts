@@ -136,10 +136,10 @@ export class HomePageComponent implements OnInit {
     }
     const [rowId] = await this.table.getSelectedRecordIds();
     const row = this.allRows.find((r) => r.rowId === rowId);
-    if (!row?.hostName) {
+    if (!row?.hostRaw) {
       return;
     }
-    const url = await this.dataService.getLatestResultUrl(row.hostName);
+    const url = await this.dataService.getLatestResultUrl(row.hostRaw);
     if (url) {
       window.open(url, '_blank');
     }

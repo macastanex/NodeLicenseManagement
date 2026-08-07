@@ -32,8 +32,7 @@
       <button
         type="button"
         class="summary__item"
-        *ngFor="let tile of tiles; let first = first"
-        [class.summary__item--boxed]="first"
+        *ngFor="let tile of tiles"
         [class.summary__item--active]="activeFilter === tile.key"
         (click)="selectTile(tile.key)"
       >
