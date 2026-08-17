@@ -19,6 +19,11 @@ export interface NodeDetailRow {
   status: string;
   registered: string;
   lastActive: string;
+  lastActiveIso: string;
+  // Ready-to-send query-results hostName predicate for View Result ('' when not lookupable).
+  resultFilter: string;
+  // 'true' when a result was already observed for this row (button can show without a query).
+  hasResult: string;
 }
 
 export interface HomePageModel {
@@ -35,6 +40,7 @@ interface RawSystem {
   host?: string;
   createdTimestamp?: string;
   lastUpdated?: string;
+  connectionState?: string;
 }
 
 interface NodeRecord {
@@ -43,6 +49,10 @@ interface NodeRecord {
   hostRaw: string;
   created: Date | null;
   lastUpdated: Date | null;
+  connectionState: string | null;
+  fromResult: boolean;
+  // Explicit query-results predicate for rows not identified by host name (NULL/empty host, SYSTEM_ID).
+  resultFilterOverride?: string;
 }
 
 interface StatusRecord extends NodeRecord {
@@ -54,24 +64,48 @@ const MONTHS_TO_BUILD = 12;
 const LICENSE_DURATION = 12;
 const PAGE_SIZE = 1000;
 
-const MANAGED_FILTER =
+// SystemLink Server has no concept of virtual nodes, so "connected.data.state" isn't a
+// queryable field there and any filter referencing it fails with a 400 Bad Request.
+const MANAGED_FILTER_WITH_VIRTUAL =
   'grains.data.host != null and grains.data.host != "" and connected.data.state != "VIRTUAL" ' +
   'and (activation.data.activated == true or activation.data.activated == null)';
-const MANAGED_PROJECTION =
+const MANAGED_FILTER_NO_VIRTUAL =
+  'grains.data.host != null and grains.data.host != "" ' +
+  'and (activation.data.activated == true or activation.data.activated == null)';
+// SLE/Valinor expose connected.data.state, letting us honor the "still CONNECTED is not stale" rule.
+const MANAGED_PROJECTION_WITH_STATE =
+  'new(id, grains.data.host as host, createdTimestamp, connected.lastUpdatedTimestamp as lastUpdated, ' +
+  'connected.data.state as connectionState)';
+const MANAGED_PROJECTION_NO_STATE =
   'new(id, grains.data.host as host, createdTimestamp, connected.lastUpdatedTimestamp as lastUpdated)';
 const VIRTUAL_FILTER = 'connected.data.state == "VIRTUAL"';
 const VIRTUAL_PROJECTION =
   'new(id, alias as host, createdTimestamp, createdTimestamp as lastUpdated)';
 
+// Sentinels used as hostRaw for the collapsed NULL / empty-host unmanaged rows so result lookups
+// can build the correct query-results filter for them.
+const NULL_HOST_TOKEN = '\u0000NULL_HOST';
+const EMPTY_HOST_TOKEN = '\u0000EMPTY_HOST';
+
 @Injectable({ providedIn: 'root' })
 export class WebappHomeDataService {
+  /** Cached across calls: whether the target instance supports the virtual node concept (SLE only). */
+  private virtualNodesSupported: boolean | null = null;
+
   constructor(private readonly context: SystemLinkContextService) {}
 
   async load(): Promise<HomePageModel> {
-    const [managedRaw, virtualRaw] = await Promise.all([
-      this.queryAllSystems(MANAGED_FILTER, MANAGED_PROJECTION),
-      this.queryAllSystems(VIRTUAL_FILTER, VIRTUAL_PROJECTION),
+    const virtualSupported = await this.detectVirtualNodeSupport();
+    const managedFilter = virtualSupported ? MANAGED_FILTER_WITH_VIRTUAL : MANAGED_FILTER_NO_VIRTUAL;
+    const managedProjection = virtualSupported ? MANAGED_PROJECTION_WITH_STATE : MANAGED_PROJECTION_NO_STATE;
+
+    const [managedRaw, virtualRaw, fleetRaw] = await Promise.all([
+      this.queryAllSystems(managedFilter, managedProjection),
+      virtualSupported ? this.queryAllSystems(VIRTUAL_FILTER, VIRTUAL_PROJECTION) : Promise.resolve([]),
+      this.queryAllSystems('id != null', 'new(id)'),
     ]);
+    // Every real system id; a SYSTEM_ID on a result that isn't here is an orphaned/misclassified host.
+    const fleetIds = new Set(fleetRaw.map((r) => r.id).filter((id): id is string => !!id));
 
     const managed: NodeRecord[] = managedRaw.map((r) => ({
       id: r.id ?? null,
@@ -79,6 +113,8 @@ export class WebappHomeDataService {
       hostRaw: (r.host ?? '').toString().trim(),
       created: this.parseDate(r.createdTimestamp),
       lastUpdated: this.parseDate(r.lastUpdated),
+      connectionState: r.connectionState ?? null,
+      fromResult: false,
     }));
 
     const virtual: NodeRecord[] = virtualRaw.map((r) => ({
@@ -87,6 +123,8 @@ export class WebappHomeDataService {
       hostRaw: (r.host ?? '').toString().trim(),
       created: this.parseDate(r.createdTimestamp),
       lastUpdated: this.parseDate(r.lastUpdated),
+      connectionState: r.connectionState ?? null,
+      fromResult: false,
     }));
     const virtualHosts = new Set(virtual.map((v) => v.host));
 
@@ -100,9 +138,19 @@ export class WebappHomeDataService {
       const snapshot = this.addMonthsUtc(now, -m);
       return { snapshot, windowStart: this.addMonthsUtc(snapshot, -LICENSE_DURATION) };
     });
-    const resultHostsByMonth = await Promise.all(
-      windows.map((w) => this.queryResultHosts(w.windowStart, w.snapshot)),
-    );
+    const [resultHostsByMonth, nullHostSysIdsByMonth, hostedSysIdsByMonth] = await Promise.all([
+      Promise.all(windows.map((w) => this.queryResultHosts(w.windowStart, w.snapshot))),
+      Promise.all(
+        windows.map((w) =>
+          this.querySystemIds('(hostName == null or hostName == "")', w.windowStart, w.snapshot),
+        ),
+      ),
+      Promise.all(
+        windows.map((w) =>
+          this.querySystemIds('hostName != null and hostName != ""', w.windowStart, w.snapshot),
+        ),
+      ),
+    ]);
 
     for (let m = 0; m < MONTHS_TO_BUILD; m++) {
       const { snapshot, windowStart } = windows[m];
@@ -111,7 +159,15 @@ export class WebappHomeDataService {
       // --- Managed snapshot ---
       const managedSnapshot = managed.filter((s) => s.created !== null && s.created <= snapshot);
       const staleIds = new Set(
-        managed.filter((s) => s.lastUpdated !== null && s.lastUpdated <= staleCutoff).map((s) => s.id),
+        managed
+          .filter((s) => {
+            if (s.lastUpdated === null || s.lastUpdated > staleCutoff) {
+              return false;
+            }
+            // On SLE the connection state is known; a still-CONNECTED node is not stale.
+            return s.connectionState !== 'CONNECTED';
+          })
+          .map((s) => s.id),
       );
       const managedRows: StatusRecord[] = managedSnapshot.map((s) => ({
         ...s,
@@ -124,14 +180,94 @@ export class WebappHomeDataService {
       const resultHosts = resultHostsByMonth[m];
       const seenResultHosts = new Set<string>();
       const resultRows: NodeRecord[] = [];
+      let hasNullHost = false;
+      let hasEmptyHost = false;
       for (const raw of resultHosts) {
-        const trimmed = (raw ?? '').toString().trim();
+        if (raw === null || raw === undefined) {
+          hasNullHost = true;
+          continue;
+        }
+        const trimmed = raw.toString().trim();
+        if (trimmed === '') {
+          hasEmptyHost = true;
+          continue;
+        }
         const key = trimmed.toUpperCase();
-        if (!key || seenResultHosts.has(key)) {
+        if (seenResultHosts.has(key)) {
           continue;
         }
         seenResultHosts.add(key);
-        resultRows.push({ id: null, host: key, hostRaw: trimmed, created: null, lastUpdated: null });
+        resultRows.push({
+          id: null,
+          host: key,
+          hostRaw: trimmed,
+          created: null,
+          lastUpdated: null,
+          connectionState: null,
+          fromResult: true,
+        });
+      }
+      // Results whose host is misclassified under SYSTEM_ID: each distinct SYSTEM_ID that is not a
+      // real system (orphaned) and never appears with a host name is a distinct unmanaged node.
+      const hostedSysIds = new Set(
+        hostedSysIdsByMonth[m]
+          .map((s) => (s ?? '').toString().trim().toUpperCase())
+          .filter((s) => s),
+      );
+      let emptySystemIdExists = false;
+      for (const raw of nullHostSysIdsByMonth[m]) {
+        const value = (raw ?? '').toString().trim();
+        if (!value) {
+          emptySystemIdExists = true;
+          continue;
+        }
+        const key = value.toUpperCase();
+        if (
+          fleetIds.has(value) ||
+          managedHosts.has(key) ||
+          virtualHosts.has(key) ||
+          seenResultHosts.has(key) ||
+          hostedSysIds.has(key)
+        ) {
+          continue;
+        }
+        seenResultHosts.add(key);
+        resultRows.push({
+          id: null,
+          host: value,
+          hostRaw: value,
+          created: null,
+          lastUpdated: null,
+          connectionState: null,
+          fromResult: true,
+          resultFilterOverride: `systemId == "${value.replace(/"/g, '\\"')}"`,
+        });
+      }
+
+      // NULL / empty host results that also lack a SYSTEM_ID collapse to one node each.
+      if (hasNullHost && emptySystemIdExists) {
+        resultRows.push({
+          id: null,
+          host: '(no host name)',
+          hostRaw: NULL_HOST_TOKEN,
+          created: null,
+          lastUpdated: null,
+          connectionState: null,
+          fromResult: true,
+          resultFilterOverride: 'hostName == null and (systemId == null or systemId == "")',
+        });
+      }
+      if (hasEmptyHost && emptySystemIdExists) {
+        resultRows.push({
+          id: null,
+          host: '(empty host name)',
+          hostRaw: EMPTY_HOST_TOKEN,
+          created: null,
+          lastUpdated: null,
+          connectionState: null,
+          fromResult: true,
+          resultFilterOverride: 'hostName != null and hostName == "" and (systemId == null or systemId == "")',
+        });
       }
 
       const combined: NodeRecord[] = [...resultRows, ...virtual];
@@ -157,8 +293,10 @@ export class WebappHomeDataService {
 
     trend.reverse(); // oldest month first for the trend chart
 
+    // Use the actual current time (not the month-start snapshot) so Last Active reflects the same
+    // latest result that the View Result link opens.
     const currentWindowStart = this.addMonthsUtc(now, -LICENSE_DURATION);
-    await this.enrichUnmanagedLastActive(currentUnmanaged, currentWindowStart, now);
+    await this.enrichUnmanagedLastActive(currentUnmanaged, currentWindowStart, new Date());
 
     const inactive = currentManaged.filter((r) => r.status === 'Inactive').length;
     const virtualCount = currentUnmanaged.filter((r) => r.status === 'Virtual').length;
@@ -203,7 +341,26 @@ export class WebappHomeDataService {
     return all;
   }
 
-  private async queryResultHosts(windowStart: Date, snapshot: Date): Promise<string[]> {
+  /** Probes whether the connected instance supports querying virtual node state (SLE only). */
+  private async detectVirtualNodeSupport(): Promise<boolean> {
+    if (this.virtualNodesSupported !== null) {
+      return this.virtualNodesSupported;
+    }
+
+    const url = this.context.buildApiUrl('nisysmgmt/v1/query-systems');
+    const response = await this.fetchWithRetry(
+      url,
+      this.context.buildRequestInit({
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filter: VIRTUAL_FILTER, skip: 0, take: 1, projection: VIRTUAL_PROJECTION }),
+      }),
+    );
+    this.virtualNodesSupported = response.ok;
+    return this.virtualNodesSupported;
+  }
+
+  private async queryResultHosts(windowStart: Date, snapshot: Date): Promise<(string | null)[]> {
     const url = this.context.buildApiUrl('nitestmonitor/v2/query-result-values');
     const filter = `updatedAt >= "${windowStart.toISOString()}" and updatedAt <= "${snapshot.toISOString()}"`;
     const response = await this.fetchWithRetry(
@@ -217,7 +374,33 @@ export class WebappHomeDataService {
     if (!response.ok) {
       throw new Error(`query-result-values failed (${response.status})`);
     }
-    const payload = (await response.json()) as string[] | { values?: string[] };
+    const payload = (await response.json()) as (string | null)[] | { values?: (string | null)[] };
+    return Array.isArray(payload) ? payload : payload.values ?? [];
+  }
+
+  /** Distinct SYSTEM_ID values among results matching the given hostName clause, within the window. */
+  private async querySystemIds(
+    hostClause: string,
+    windowStart: Date,
+    snapshot: Date,
+  ): Promise<(string | null)[]> {
+    const url = this.context.buildApiUrl('nitestmonitor/v2/query-result-values');
+    const filter =
+      `${hostClause} ` +
+      `and updatedAt >= "${windowStart.toISOString()}" and updatedAt <= "${snapshot.toISOString()}"`;
+    const response = await this.fetchWithRetry(
+      url,
+      this.context.buildRequestInit({
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ field: 'SYSTEM_ID', filter }),
+      }),
+    );
+    if (!response.ok) {
+      // Best-effort grouping; skip if the service rejects the query.
+      return [];
+    }
+    const payload = (await response.json()) as (string | null)[] | { values?: (string | null)[] };
     return Array.isArray(payload) ? payload : payload.values ?? [];
   }
 
@@ -227,9 +410,28 @@ export class WebappHomeDataService {
     windowStart: Date,
     windowEnd: Date,
   ): Promise<void> {
+    // Rows identified by an explicit predicate (NULL/empty host or misclassified SYSTEM_ID) can't
+    // be matched by host key, so query each directly.
+    for (const row of rows) {
+      if (row.nodeType === 'Unmanaged' && !row.lastUpdated && row.resultFilterOverride) {
+        row.lastUpdated = await this.getLatestResultTimestampByFilter(
+          row.resultFilterOverride,
+          windowStart,
+          windowEnd,
+        );
+      }
+    }
+
     const targetKeys = new Set(
       rows
-        .filter((r) => r.nodeType === 'Unmanaged' && r.status === 'Active' && !r.lastUpdated && r.hostRaw)
+        .filter(
+          (r) =>
+            r.nodeType === 'Unmanaged' &&
+            r.status === 'Active' &&
+            !r.lastUpdated &&
+            r.hostRaw &&
+            !r.resultFilterOverride,
+        )
         .map((r) => r.hostRaw.toUpperCase()),
     );
     if (targetKeys.size === 0) {
@@ -292,11 +494,12 @@ export class WebappHomeDataService {
     }
   }
 
-  /** Returns a URL to the latest test result for the given host, or null if none exists. */
-  async getLatestResultUrl(hostName: string): Promise<string | null> {
+  /** Returns a URL to the latest test result for the given hostName predicate, or null if none. */
+  async getLatestResultUrl(filter: string): Promise<string | null> {
+    if (!filter) {
+      return null;
+    }
     const url = this.context.buildApiUrl('nitestmonitor/v2/query-results');
-    const key = hostName.trim().toUpperCase().replace(/"/g, '\\"');
-    const filter = `hostName != null and hostName.ToUpper() == "${key}"`;
     const response = await this.fetchWithRetry(
       url,
       this.context.buildRequestInit({
@@ -313,18 +516,63 @@ export class WebappHomeDataService {
     return id ? `${this.context.origin}/testinsights/results/result/${id}` : null;
   }
 
+  /** Builds the query-results hostName predicate for a normal host. */
+  private buildHostFilter(hostRaw: string): string {
+    const key = hostRaw.trim().toUpperCase().replace(/"/g, '\\"');
+    return `hostName != null and hostName.ToUpper() == "${key}"`;
+  }
+
+  /** Latest result timestamp for a hostName/systemId predicate, bounded to the window. */
+  private async getLatestResultTimestampByFilter(
+    hostFilter: string,
+    windowStart: Date,
+    windowEnd: Date,
+  ): Promise<Date | null> {
+    const url = this.context.buildApiUrl('nitestmonitor/v2/query-results');
+    const filter =
+      `${hostFilter} ` +
+      `and updatedAt >= "${windowStart.toISOString()}" and updatedAt <= "${windowEnd.toISOString()}"`;
+    const response = await this.fetchWithRetry(
+      url,
+      this.context.buildRequestInit({
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filter,
+          orderBy: 'UPDATED_AT',
+          descending: true,
+          take: 1,
+          projection: ['UPDATED_AT', 'STARTED_AT'],
+        }),
+      }),
+    );
+    if (!response.ok) {
+      return null;
+    }
+    const payload = (await response.json()) as {
+      results?: { updatedAt?: string; startedAt?: string }[];
+    };
+    const result = payload.results?.[0];
+    return result ? this.parseDate(result.updatedAt ?? result.startedAt) : null;
+  }
+
   private toDetailRow(record: StatusRecord, index: number): NodeDetailRow {
     const id = record.id ?? '';
+    // Keep the NULL/empty sentinel out of the DOM; the clean predicate lives in resultFilter.
+    const isToken = record.hostRaw === NULL_HOST_TOKEN || record.hostRaw === EMPTY_HOST_TOKEN;
     return {
       rowId: `${index}`,
       id,
       systemUrl: id ? `/systems/${id}` : '',
       hostName: record.host,
-      hostRaw: record.hostRaw,
+      hostRaw: isToken ? '' : record.hostRaw,
       nodeType: record.nodeType,
       status: record.status,
       registered: this.formatTimestamp(record.created),
       lastActive: this.formatTimestamp(record.lastUpdated),
+      lastActiveIso: record.lastUpdated ? record.lastUpdated.toISOString() : '',
+      resultFilter: record.resultFilterOverride ?? (record.hostRaw ? this.buildHostFilter(record.hostRaw) : ''),
+      hasResult: record.fromResult ? 'true' : '',
     };
   }
 
@@ -375,9 +623,15 @@ export class WebappHomeDataService {
       return '';
     }
     // Display in the browser's local timezone to match how SystemLink shows timestamps.
-    const d = `${date.getFullYear()}-${this.pad(date.getMonth() + 1)}-${this.pad(date.getDate())}`;
-    const t = `${this.pad(date.getHours())}:${this.pad(date.getMinutes())}:${this.pad(date.getSeconds())}`;
-    return `${d} ${t}`;
+    return date.toLocaleString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+    });
   }
 
   private pad(value: number): string {

@@ -16,6 +16,7 @@ interface StatTile {
   label: string;
   value: number;
   color: string;
+  description: string;
 }
 
 interface PieSlice {
@@ -82,14 +83,19 @@ export class HomePageComponent implements OnInit {
   bars: BarColumn[] = [];
   axisTicks: AxisTick[] = [];
   activeFilter = 'total';
+  viewResultUrl: string | null = null;
+  viewResultAvailable = false;
 
   private allRows: NodeDetailRow[] = [];
+  private selectionToken = 0;
+  private selectedFilter = '';
+  private readonly resultUrlCache = new Map<string, string | null>();
 
   @ViewChild(NimbleTableDirective) private table?: NimbleTableDirective<NodeDetailRow>;
 
   readonly detailData$ = new BehaviorSubject<NodeDetailRow[]>([]);
 
-  tooltip = { visible: false, x: 0, y: 0, text: '' };
+  tooltip = { visible: false, x: 0, y: 0, text: '', wide: false };
 
   constructor(
     private readonly dataService: WebappHomeDataService,
@@ -108,7 +114,8 @@ export class HomePageComponent implements OnInit {
       const value = await this.dataService.load();
       this.state = { value, isLoading: false, error: null };
       this.buildCharts(value);
-      this.allRows = [...value.detail].sort((a, b) => b.lastActive.localeCompare(a.lastActive));
+      this.resultUrlCache.clear();
+      this.allRows = [...value.detail].sort((a, b) => b.lastActiveIso.localeCompare(a.lastActiveIso));
       this.applyFilter();
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : 'Failed to load node license data.';
@@ -116,8 +123,8 @@ export class HomePageComponent implements OnInit {
     }
   }
 
-  showTip(event: MouseEvent, text: string): void {
-    this.tooltip = { visible: true, x: event.clientX + 12, y: event.clientY + 12, text };
+  showTip(event: MouseEvent, text: string, wide = false): void {
+    this.tooltip = { visible: true, x: event.clientX + 12, y: event.clientY + 12, text, wide };
   }
 
   hideTip(): void {
@@ -130,22 +137,120 @@ export class HomePageComponent implements OnInit {
     this.applyFilter();
   }
 
+  exportCsv(): void {
+    const columns: { header: string; field: keyof NodeDetailRow }[] = [
+      { header: 'Minion ID', field: 'id' },
+      { header: 'Host Name', field: 'hostName' },
+      { header: 'Node Type', field: 'nodeType' },
+      { header: 'Status', field: 'status' },
+      { header: 'Registered', field: 'registered' },
+      { header: 'Last Active', field: 'lastActive' },
+    ];
+    const rows = this.detailData$.value;
+    const escape = (value: string): string => `"${(value ?? '').replace(/"/g, '""')}"`;
+    const lines = [
+      columns.map((c) => escape(c.header)).join(','),
+      ...rows.map((row) => columns.map((c) => escape(row[c.field])).join(',')),
+    ];
+    const blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `node-license-${this.activeFilter}-${this.timestampSuffix()}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  private timestampSuffix(): string {
+    const now = new Date();
+    const pad = (v: number): string => v.toString().padStart(2, '0');
+    return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`;
+  }
+
   async onRowDoubleClick(): Promise<void> {
     if (!this.table) {
       return;
     }
     const [rowId] = await this.table.getSelectedRecordIds();
     const row = this.allRows.find((r) => r.rowId === rowId);
-    if (!row?.hostRaw) {
+    if (!row?.resultFilter) {
       return;
     }
-    const url = await this.dataService.getLatestResultUrl(row.hostRaw);
+    const url = await this.resolveResultUrl(row.resultFilter);
     if (url) {
       window.open(url, '_blank');
     }
   }
 
+  async onSelectionChange(): Promise<void> {
+    // Guards against stale results when the selection changes mid-query.
+    const token = ++this.selectionToken;
+    this.viewResultUrl = null;
+    this.viewResultAvailable = false;
+    this.selectedFilter = '';
+    if (!this.table) {
+      return;
+    }
+    const [rowId] = await this.table.getSelectedRecordIds();
+    const row = this.allRows.find((r) => r.rowId === rowId);
+    if (!row?.resultFilter) {
+      return;
+    }
+    this.selectedFilter = row.resultFilter;
+
+    // Previously resolved for this host: reuse without another query.
+    if (this.resultUrlCache.has(row.resultFilter)) {
+      const cached = this.resultUrlCache.get(row.resultFilter) ?? null;
+      this.viewResultUrl = cached;
+      this.viewResultAvailable = cached !== null;
+      return;
+    }
+
+    // A result was already observed for this row, so show the button immediately and resolve the
+    // exact URL lazily instead of blocking on a query.
+    if (row.hasResult === 'true') {
+      this.viewResultAvailable = true;
+    }
+
+    const url = await this.dataService.getLatestResultUrl(row.resultFilter);
+    if (token !== this.selectionToken) {
+      return;
+    }
+    this.resultUrlCache.set(row.resultFilter, url);
+    this.viewResultUrl = url;
+    this.viewResultAvailable = url !== null;
+  }
+
+  async viewResult(): Promise<void> {
+    if (this.viewResultUrl) {
+      window.open(this.viewResultUrl, '_blank');
+      return;
+    }
+    if (!this.selectedFilter) {
+      return;
+    }
+    const url = await this.resolveResultUrl(this.selectedFilter);
+    if (url) {
+      window.open(url, '_blank');
+    }
+  }
+
+  private async resolveResultUrl(filter: string): Promise<string | null> {
+    const cached = this.resultUrlCache.get(filter);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const url = await this.dataService.getLatestResultUrl(filter);
+    this.resultUrlCache.set(filter, url);
+    return url;
+  }
+
   private applyFilter(): void {
+    // Selection is cleared when the table data changes, so the View Result button hides.
+    this.viewResultUrl = null;
+    this.viewResultAvailable = false;
+    this.selectedFilter = '';
+    this.selectionToken++;
     const predicate = (row: NodeDetailRow): boolean => {
       switch (this.activeFilter) {
         case 'managed':
@@ -165,11 +270,47 @@ export class HomePageComponent implements OnInit {
 
   private buildCharts(model: HomePageModel): void {
     this.tiles = [
-      { key: 'total', label: 'Total Nodes', value: model.managed + model.unmanaged, color: 'var(--app-strong)' },
-      { key: 'managed', label: 'Managed', value: model.managed, color: MANAGED_COLOR },
-      { key: 'unmanaged', label: 'Unmanaged', value: model.unmanaged, color: UNMANAGED_COLOR },
-      { key: 'inactive', label: 'Managed (Inactive)', value: model.inactive, color: INACTIVE_COLOR },
-      { key: 'virtual', label: 'Unmanaged (Virtual)', value: model.virtual, color: VIRTUAL_COLOR },
+      {
+        key: 'total',
+        label: 'Total Nodes',
+        value: model.managed + model.unmanaged,
+        color: 'var(--app-strong)',
+        description: 'Total licensed nodes: the sum of Managed and Unmanaged nodes.',
+      },
+      {
+        key: 'managed',
+        label: 'Managed',
+        value: model.managed,
+        color: MANAGED_COLOR,
+        description:
+          'A system that is not virtual and has a valid host name. Counted against licensing no matter ' +
+          'how long it has been online.',
+      },
+      {
+        key: 'unmanaged',
+        label: 'Unmanaged',
+        value: model.unmanaged,
+        color: UNMANAGED_COLOR,
+        description:
+          'A system that is not Managed but has reported test results in the last 12 months, or any ' +
+          'virtual system regardless of whether the system has results.',
+      },
+      {
+        key: 'inactive',
+        label: 'Managed (Inactive)',
+        value: model.inactive,
+        color: INACTIVE_COLOR,
+        description:
+          'A Managed system that has not been online in the last 12 months. Still counted against ' +
+          'licensing, so it is a good candidate to remove and free up a license.',
+      },
+      {
+        key: 'virtual',
+        label: 'Unmanaged (Virtual)',
+        value: model.virtual,
+        color: VIRTUAL_COLOR,
+        description: 'A system classified as virtual by SystemLink.',
+      },
     ];
     this.pieSlices = this.buildPie(model.managed, model.unmanaged);
     this.buildBars(model);

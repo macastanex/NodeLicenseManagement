@@ -41,6 +41,8 @@
 .app-header__actions {
   margin-left: auto;
   flex: none;
+  display: flex;
+  gap: var(--ni-nimble-standard-padding);
 }
 
 .summary {
@@ -205,6 +207,12 @@
   font: var(--ni-nimble-subtitle-font);
   border-radius: 3px;
   white-space: nowrap;
+}
+
+.chart-tooltip--wide {
+  white-space: normal;
+  max-width: 320px;
+  line-height: 1.35;
 }
 
 @media (max-width: 900px) {

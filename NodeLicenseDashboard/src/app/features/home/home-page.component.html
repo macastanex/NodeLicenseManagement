@@ -20,6 +20,8 @@
       </p>
     </div>
     <div class="app-header__actions">
+      <nimble-button *ngIf="viewResultAvailable" appearance="outline" (click)="viewResult()">View Result</nimble-button>
+      <nimble-button appearance="outline" (click)="exportCsv()">Export CSV</nimble-button>
       <nimble-button appearance="outline" (click)="reload()">Refresh</nimble-button>
     </div>
   </header>
@@ -35,6 +37,9 @@
         *ngFor="let tile of tiles"
         [class.summary__item--active]="activeFilter === tile.key"
         (click)="selectTile(tile.key)"
+        (mouseenter)="showTip($event, tile.description, true)"
+        (mousemove)="showTip($event, tile.description, true)"
+        (mouseleave)="hideTip()"
       >
         <span class="summary__value" [style.color]="tile.color">{{ tile.value }}</span>
         <span class="summary__label">{{ tile.label }}</span>
@@ -160,6 +165,7 @@
         [data$]="detailData$"
         selection-mode="single"
         (dblclick)="onRowDoubleClick()"
+        (selection-change)="onSelectionChange()"
         style="--ni-nimble-fail-color: #5b9bd5;"
       >
         <nimble-table-column-anchor
@@ -217,6 +223,7 @@
   <div
     class="chart-tooltip"
     *ngIf="tooltip.visible"
+    [class.chart-tooltip--wide]="tooltip.wide"
     [style.left.px]="tooltip.x"
     [style.top.px]="tooltip.y"
   >
