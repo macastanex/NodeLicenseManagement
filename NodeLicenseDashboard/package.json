@@ -6,7 +6,7 @@
   "scripts": {
     "start": "ng serve --host 0.0.0.0",
     "build": "ng build",
-    "pack:nipkg": "slcli webapp pack dist/nodelicensedashboard/browser --output dist/NodeLicenseDashboard.nipkg",
+    "pack:nipkg": "slcli webapp pack --config nipkg.config.json --output dist/NodeLicenseDashboard.nipkg",
     "publish:webapp": "slcli webapp publish dist/NodeLicenseDashboard.nipkg --id 5a8ce8ff-c7e9-400f-bdec-e0bd10f1f31c",
     "publish:demo": "npm run build && npm run pack:nipkg && npm run publish:webapp"
   },

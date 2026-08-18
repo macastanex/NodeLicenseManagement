@@ -20,10 +20,10 @@ export interface NodeDetailRow {
   registered: string;
   lastActive: string;
   lastActiveIso: string;
-  // Ready-to-send query-results hostName predicate for View Result ('' when not lookupable).
-  resultFilter: string;
-  // 'true' when a result was already observed for this row (button can show without a query).
-  hasResult: string;
+  // Direct link to the latest test result for this row ('' when none).
+  resultUrl: string;
+  // 'View' when a result link exists, otherwise '' so the anchor shows its placeholder.
+  resultLabel: string;
 }
 
 export interface HomePageModel {
@@ -33,11 +33,14 @@ export interface HomePageModel {
   virtual: number;
   trend: TrendPoint[];
   detail: NodeDetailRow[];
+  // Runs the slow Last Active enrichment on demand and returns the updated detail rows.
+  enrichLastActive: () => Promise<NodeDetailRow[]>;
 }
 
 interface RawSystem {
   id?: string;
   host?: string;
+  localhostName?: string;
   createdTimestamp?: string;
   lastUpdated?: string;
   connectionState?: string;
@@ -53,6 +56,10 @@ interface NodeRecord {
   fromResult: boolean;
   // Explicit query-results predicate for rows not identified by host name (NULL/empty host, SYSTEM_ID).
   resultFilterOverride?: string;
+  // Direct link to the latest test result, resolved during enrichment.
+  resultUrl?: string;
+  // Raw OS hostname (grains.data.host) when it differs from the displayed host, kept for result matching.
+  altHost?: string | null;
 }
 
 interface StatusRecord extends NodeRecord {
@@ -74,10 +81,11 @@ const MANAGED_FILTER_NO_VIRTUAL =
   'and (activation.data.activated == true or activation.data.activated == null)';
 // SLE/Valinor expose connected.data.state, letting us honor the "still CONNECTED is not stale" rule.
 const MANAGED_PROJECTION_WITH_STATE =
-  'new(id, grains.data.host as host, createdTimestamp, connected.lastUpdatedTimestamp as lastUpdated, ' +
-  'connected.data.state as connectionState)';
+  'new(id, grains.data.host as host, grains.data.localhost as localhostName, createdTimestamp, ' +
+  'connected.lastUpdatedTimestamp as lastUpdated, connected.data.state as connectionState)';
 const MANAGED_PROJECTION_NO_STATE =
-  'new(id, grains.data.host as host, createdTimestamp, connected.lastUpdatedTimestamp as lastUpdated)';
+  'new(id, grains.data.host as host, grains.data.localhost as localhostName, createdTimestamp, ' +
+  'connected.lastUpdatedTimestamp as lastUpdated)';
 const VIRTUAL_FILTER = 'connected.data.state == "VIRTUAL"';
 const VIRTUAL_PROJECTION =
   'new(id, alias as host, createdTimestamp, createdTimestamp as lastUpdated)';
@@ -92,30 +100,75 @@ export class WebappHomeDataService {
   /** Cached across calls: whether the target instance supports the virtual node concept (SLE only). */
   private virtualNodesSupported: boolean | null = null;
 
+  // Caps concurrent in-flight requests so aggressive parallelism doesn't trigger 429s.
+  private readonly maxConcurrentRequests = 6;
+  private activeRequests = 0;
+  private readonly requestWaiters: (() => void)[] = [];
+
   constructor(private readonly context: SystemLinkContextService) {}
 
   async load(): Promise<HomePageModel> {
+    const now = this.firstOfMonthUtc(new Date());
+    const windows = Array.from({ length: MONTHS_TO_BUILD }, (_, m) => {
+      const snapshot = this.addMonthsUtc(now, -m);
+      return { snapshot, windowStart: this.addMonthsUtc(snapshot, -LICENSE_DURATION) };
+    });
+
+    // Kick off every query that doesn't depend on virtual-node support so the systems queries and
+    // the per-month result queries all run concurrently instead of in sequential batches.
+    const fleetPromise = this.queryAllSystems('id != null', 'new(id)');
+    const resultHostsPromise = Promise.all(
+      windows.map((w) => this.queryResultHosts(w.windowStart, w.snapshot)),
+    );
+    const nullHostSysIdsPromise = Promise.all(
+      windows.map((w) =>
+        this.querySystemIds('(hostName == null or hostName == "")', w.windowStart, w.snapshot),
+      ),
+    );
+    const hostedSysIdsPromise = Promise.all(
+      windows.map((w) =>
+        this.querySystemIds('hostName != null and hostName != ""', w.windowStart, w.snapshot),
+      ),
+    );
+
     const virtualSupported = await this.detectVirtualNodeSupport();
     const managedFilter = virtualSupported ? MANAGED_FILTER_WITH_VIRTUAL : MANAGED_FILTER_NO_VIRTUAL;
     const managedProjection = virtualSupported ? MANAGED_PROJECTION_WITH_STATE : MANAGED_PROJECTION_NO_STATE;
 
-    const [managedRaw, virtualRaw, fleetRaw] = await Promise.all([
-      this.queryAllSystems(managedFilter, managedProjection),
-      virtualSupported ? this.queryAllSystems(VIRTUAL_FILTER, VIRTUAL_PROJECTION) : Promise.resolve([]),
-      this.queryAllSystems('id != null', 'new(id)'),
-    ]);
+    const [managedRaw, virtualRaw, fleetRaw, resultHostsByMonth, nullHostSysIdsByMonth, hostedSysIdsByMonth] =
+      await Promise.all([
+        this.queryAllSystems(managedFilter, managedProjection),
+        virtualSupported ? this.queryAllSystems(VIRTUAL_FILTER, VIRTUAL_PROJECTION) : Promise.resolve([]),
+        fleetPromise,
+        resultHostsPromise,
+        nullHostSysIdsPromise,
+        hostedSysIdsPromise,
+      ]);
     // Every real system id; a SYSTEM_ID on a result that isn't here is an orphaned/misclassified host.
     const fleetIds = new Set(fleetRaw.map((r) => r.id).filter((id): id is string => !!id));
 
-    const managed: NodeRecord[] = managedRaw.map((r) => ({
-      id: r.id ?? null,
-      host: (r.host ?? '').toString().trim(),
-      hostRaw: (r.host ?? '').toString().trim(),
-      created: this.parseDate(r.createdTimestamp),
-      lastUpdated: this.parseDate(r.lastUpdated),
-      connectionState: r.connectionState ?? null,
-      fromResult: false,
-    }));
+    const managed: NodeRecord[] = managedRaw.map((r) => {
+      const rawHost = (r.host ?? '').toString().trim();
+      const localhostName = (r.localhostName ?? '').toString().trim();
+      // NI Linux RT targets report grains.data.host as "localhost"; prefer the friendlier
+      // grains.data.localhost (the SystemLink "Hostname") when the raw host is generic.
+      const display =
+        localhostName && localhostName.toLowerCase() !== 'localhost'
+          ? localhostName
+          : rawHost && rawHost.toLowerCase() !== 'localhost'
+            ? rawHost
+            : localhostName || rawHost;
+      return {
+        id: r.id ?? null,
+        host: display,
+        hostRaw: display,
+        created: this.parseDate(r.createdTimestamp),
+        lastUpdated: this.parseDate(r.lastUpdated),
+        connectionState: r.connectionState ?? null,
+        fromResult: false,
+        altHost: rawHost && rawHost.toUpperCase() !== display.toUpperCase() ? rawHost : null,
+      };
+    });
 
     const virtual: NodeRecord[] = virtualRaw.map((r) => ({
       id: r.id ?? null,
@@ -128,29 +181,9 @@ export class WebappHomeDataService {
     }));
     const virtualHosts = new Set(virtual.map((v) => v.host));
 
-    const now = this.firstOfMonthUtc(new Date());
     const trend: TrendPoint[] = [];
     let currentManaged: StatusRecord[] = [];
     let currentUnmanaged: StatusRecord[] = [];
-
-    // Prefetch every month's result-host window in parallel instead of sequentially.
-    const windows = Array.from({ length: MONTHS_TO_BUILD }, (_, m) => {
-      const snapshot = this.addMonthsUtc(now, -m);
-      return { snapshot, windowStart: this.addMonthsUtc(snapshot, -LICENSE_DURATION) };
-    });
-    const [resultHostsByMonth, nullHostSysIdsByMonth, hostedSysIdsByMonth] = await Promise.all([
-      Promise.all(windows.map((w) => this.queryResultHosts(w.windowStart, w.snapshot))),
-      Promise.all(
-        windows.map((w) =>
-          this.querySystemIds('(hostName == null or hostName == "")', w.windowStart, w.snapshot),
-        ),
-      ),
-      Promise.all(
-        windows.map((w) =>
-          this.querySystemIds('hostName != null and hostName != ""', w.windowStart, w.snapshot),
-        ),
-      ),
-    ]);
 
     for (let m = 0; m < MONTHS_TO_BUILD; m++) {
       const { snapshot, windowStart } = windows[m];
@@ -174,7 +207,14 @@ export class WebappHomeDataService {
         nodeType: 'Managed',
         status: staleIds.has(s.id) ? 'Inactive' : 'Active',
       }));
-      const managedHosts = new Set(managedSnapshot.map((s) => s.host.toUpperCase()));
+      const managedHosts = new Set<string>();
+      for (const s of managedSnapshot) {
+        managedHosts.add(s.host.toUpperCase());
+        // Also exclude the raw OS hostname so results reported under it aren't counted as unmanaged.
+        if (s.altHost) {
+          managedHosts.add(s.altHost.toUpperCase());
+        }
+      }
 
       // --- Unmanaged snapshot (Test Monitor result hosts + virtual, minus managed) ---
       const resultHosts = resultHostsByMonth[m];
@@ -293,14 +333,20 @@ export class WebappHomeDataService {
 
     trend.reverse(); // oldest month first for the trend chart
 
-    // Use the actual current time (not the month-start snapshot) so Last Active reflects the same
-    // latest result that the View Result link opens.
-    const currentWindowStart = this.addMonthsUtc(now, -LICENSE_DURATION);
-    await this.enrichUnmanagedLastActive(currentUnmanaged, currentWindowStart, new Date());
-
     const inactive = currentManaged.filter((r) => r.status === 'Inactive').length;
     const virtualCount = currentUnmanaged.filter((r) => r.status === 'Virtual').length;
-    const detail = [...currentManaged, ...currentUnmanaged].map((r, index) => this.toDetailRow(r, index));
+    const buildDetail = (): NodeDetailRow[] =>
+      [...currentManaged, ...currentUnmanaged].map((r, index) => this.toDetailRow(r, index));
+
+    // Defer the slow Last Active enrichment (paginated result scan) so the dashboard renders first.
+    // Use the actual current time so Last Active matches the result the View Result link opens.
+    const currentWindowStart = this.addMonthsUtc(now, -LICENSE_DURATION);
+    // Hosts known to have results this window; used to target every row that should get a result link.
+    const currentResultHostSet = new Set(
+      (resultHostsByMonth[0] ?? [])
+        .map((h) => (h ?? '').toString().trim().toUpperCase())
+        .filter((h) => h),
+    );
 
     return {
       managed: currentManaged.length,
@@ -308,7 +354,16 @@ export class WebappHomeDataService {
       inactive,
       virtual: virtualCount,
       trend,
-      detail,
+      detail: buildDetail(),
+      enrichLastActive: async () => {
+        await this.enrichResults(
+          [...currentManaged, ...currentUnmanaged],
+          currentWindowStart,
+          new Date(),
+          currentResultHostSet,
+        );
+        return buildDetail();
+      },
     };
   }
 
@@ -404,47 +459,53 @@ export class WebappHomeDataService {
     return Array.isArray(payload) ? payload : payload.values ?? [];
   }
 
-  /** Fills lastUpdated for unmanaged Active rows by scanning recent results once (not per-host). */
-  private async enrichUnmanagedLastActive(
-    rows: StatusRecord[],
+  /** Fills Last Active and Result links for detail rows via a single paged results scan. */
+  private async enrichResults(
+    records: StatusRecord[],
     windowStart: Date,
     windowEnd: Date,
+    resultHosts: Set<string>,
   ): Promise<void> {
-    // Rows identified by an explicit predicate (NULL/empty host or misclassified SYSTEM_ID) can't
-    // be matched by host key, so query each directly.
-    for (const row of rows) {
-      if (row.nodeType === 'Unmanaged' && !row.lastUpdated && row.resultFilterOverride) {
-        row.lastUpdated = await this.getLatestResultTimestampByFilter(
-          row.resultFilterOverride,
-          windowStart,
-          windowEnd,
-        );
+    // Rows identified by an explicit predicate (NULL/empty host or SYSTEM_ID) can't be matched by
+    // host key, so query each directly — in parallel.
+    const overrideRows = records.filter((r) => r.resultFilterOverride);
+    await Promise.all(
+      overrideRows.map(async (row) => {
+        const latest = await this.getLatestResult(row.resultFilterOverride as string, windowStart, windowEnd);
+        if (latest.timestamp && !row.lastUpdated) {
+          row.lastUpdated = latest.timestamp;
+        }
+        if (latest.id) {
+          row.resultUrl = this.resultUrlFromId(latest.id);
+        }
+      }),
+    );
+
+    // Target every row (managed/virtual/unmanaged) whose host is known to have results, so the scan
+    // captures each one's latest result id — not just the unmanaged rows needing Last Active.
+    const targetKeys = new Set<string>();
+    for (const r of records) {
+      if (r.resultFilterOverride || !r.host) {
+        continue;
+      }
+      const key = r.host.toUpperCase();
+      if (resultHosts.has(key)) {
+        targetKeys.add(key);
       }
     }
-
-    const targetKeys = new Set(
-      rows
-        .filter(
-          (r) =>
-            r.nodeType === 'Unmanaged' &&
-            r.status === 'Active' &&
-            !r.lastUpdated &&
-            r.hostRaw &&
-            !r.resultFilterOverride,
-        )
-        .map((r) => r.hostRaw.toUpperCase()),
-    );
     if (targetKeys.size === 0) {
       return;
     }
 
     const url = this.context.buildApiUrl('nitestmonitor/v2/query-results');
     const filter = `updatedAt >= "${windowStart.toISOString()}" and updatedAt <= "${windowEnd.toISOString()}"`;
-    const latestByHost = new Map<string, Date>();
+    // Latest result (id + timestamp) per host; captured for every host seen, not just targets.
+    const latestByHost = new Map<string, { ts: Date | null; id?: string }>();
+    let targetsFound = 0;
     let continuationToken: string | undefined;
     const maxPages = 60;
 
-    for (let page = 0; page < maxPages && latestByHost.size < targetKeys.size; page++) {
+    for (let page = 0; page < maxPages && targetsFound < targetKeys.size; page++) {
       const response = await this.fetchWithRetry(
         url,
         this.context.buildRequestInit({
@@ -455,7 +516,7 @@ export class WebappHomeDataService {
             orderBy: 'UPDATED_AT',
             descending: true,
             take: 1000,
-            projection: ['HOST_NAME', 'STARTED_AT', 'UPDATED_AT'],
+            projection: ['HOST_NAME', 'STARTED_AT', 'UPDATED_AT', 'ID'],
             continuationToken,
           }),
         }),
@@ -464,18 +525,19 @@ export class WebappHomeDataService {
         break;
       }
       const payload = (await response.json()) as {
-        results?: { hostName?: string; startedAt?: string; updatedAt?: string }[];
+        results?: { hostName?: string; startedAt?: string; updatedAt?: string; id?: string }[];
         continuationToken?: string;
       };
       const results = payload.results ?? [];
       for (const result of results) {
         // Results are newest-first, so the first hit per host is its latest.
         const key = (result.hostName ?? '').trim().toUpperCase();
-        if (key && targetKeys.has(key) && !latestByHost.has(key)) {
-          const timestamp = this.parseDate(result.updatedAt ?? result.startedAt);
-          if (timestamp) {
-            latestByHost.set(key, timestamp);
-          }
+        if (!key || latestByHost.has(key)) {
+          continue;
+        }
+        latestByHost.set(key, { ts: this.parseDate(result.updatedAt ?? result.startedAt), id: result.id });
+        if (targetKeys.has(key)) {
+          targetsFound++;
         }
       }
       continuationToken = payload.continuationToken;
@@ -484,50 +546,30 @@ export class WebappHomeDataService {
       }
     }
 
-    for (const row of rows) {
-      if (row.nodeType === 'Unmanaged' && row.status === 'Active' && !row.lastUpdated) {
-        const timestamp = latestByHost.get(row.hostRaw.toUpperCase());
-        if (timestamp) {
-          row.lastUpdated = timestamp;
-        }
+    for (const row of records) {
+      const entry = latestByHost.get(row.host.toUpperCase());
+      if (!entry) {
+        continue;
+      }
+      if (row.nodeType === 'Unmanaged' && row.status === 'Active' && !row.lastUpdated && entry.ts) {
+        row.lastUpdated = entry.ts;
+      }
+      if (!row.resultUrl && entry.id) {
+        row.resultUrl = this.resultUrlFromId(entry.id);
       }
     }
   }
 
-  /** Returns a URL to the latest test result for the given hostName predicate, or null if none. */
-  async getLatestResultUrl(filter: string): Promise<string | null> {
-    if (!filter) {
-      return null;
-    }
-    const url = this.context.buildApiUrl('nitestmonitor/v2/query-results');
-    const response = await this.fetchWithRetry(
-      url,
-      this.context.buildRequestInit({
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filter, orderBy: 'UPDATED_AT', descending: true, take: 1, projection: ['ID'] }),
-      }),
-    );
-    if (!response.ok) {
-      return null;
-    }
-    const payload = (await response.json()) as { results?: { id?: string }[] };
-    const id = payload.results?.[0]?.id;
-    return id ? `${this.context.origin}/testinsights/results/result/${id}` : null;
+  private resultUrlFromId(id: string): string {
+    return `${this.context.origin}/testinsights/results/result/${id}`;
   }
 
-  /** Builds the query-results hostName predicate for a normal host. */
-  private buildHostFilter(hostRaw: string): string {
-    const key = hostRaw.trim().toUpperCase().replace(/"/g, '\\"');
-    return `hostName != null and hostName.ToUpper() == "${key}"`;
-  }
-
-  /** Latest result timestamp for a hostName/systemId predicate, bounded to the window. */
-  private async getLatestResultTimestampByFilter(
+  /** Latest result (timestamp + id) for a hostName/systemId predicate, bounded to the window. */
+  private async getLatestResult(
     hostFilter: string,
     windowStart: Date,
     windowEnd: Date,
-  ): Promise<Date | null> {
+  ): Promise<{ timestamp: Date | null; id: string | null }> {
     const url = this.context.buildApiUrl('nitestmonitor/v2/query-results');
     const filter =
       `${hostFilter} ` +
@@ -542,18 +584,20 @@ export class WebappHomeDataService {
           orderBy: 'UPDATED_AT',
           descending: true,
           take: 1,
-          projection: ['UPDATED_AT', 'STARTED_AT'],
+          projection: ['ID', 'UPDATED_AT', 'STARTED_AT'],
         }),
       }),
     );
     if (!response.ok) {
-      return null;
+      return { timestamp: null, id: null };
     }
     const payload = (await response.json()) as {
-      results?: { updatedAt?: string; startedAt?: string }[];
+      results?: { id?: string; updatedAt?: string; startedAt?: string }[];
     };
     const result = payload.results?.[0];
-    return result ? this.parseDate(result.updatedAt ?? result.startedAt) : null;
+    return result
+      ? { timestamp: this.parseDate(result.updatedAt ?? result.startedAt), id: result.id ?? null }
+      : { timestamp: null, id: null };
   }
 
   private toDetailRow(record: StatusRecord, index: number): NodeDetailRow {
@@ -571,15 +615,15 @@ export class WebappHomeDataService {
       registered: this.formatTimestamp(record.created),
       lastActive: this.formatTimestamp(record.lastUpdated),
       lastActiveIso: record.lastUpdated ? record.lastUpdated.toISOString() : '',
-      resultFilter: record.resultFilterOverride ?? (record.hostRaw ? this.buildHostFilter(record.hostRaw) : ''),
-      hasResult: record.fromResult ? 'true' : '',
+      resultUrl: record.resultUrl ?? '',
+      resultLabel: record.resultUrl ? 'View Result' : '',
     };
   }
 
   /** Fetch wrapper that retries on 429/503 with backoff (honoring Retry-After). */
-  private async fetchWithRetry(url: string, init: RequestInit, maxRetries = 5): Promise<Response> {
+  private async fetchWithRetry(url: string, init: RequestInit, maxRetries = 6): Promise<Response> {
     for (let attempt = 0; ; attempt++) {
-      const response = await fetch(url, init);
+      const response = await this.withSlot(() => fetch(url, init));
       if ((response.status !== 429 && response.status !== 503) || attempt >= maxRetries) {
         return response;
       }
@@ -589,6 +633,20 @@ export class WebappHomeDataService {
           ? retryAfter * 1000
           : Math.min(500 * 2 ** attempt, 8000);
       await this.delay(backoff + Math.random() * 250);
+    }
+  }
+
+  /** Runs a request while holding one of a limited number of concurrency slots. */
+  private async withSlot<T>(run: () => Promise<T>): Promise<T> {
+    while (this.activeRequests >= this.maxConcurrentRequests) {
+      await new Promise<void>((resolve) => this.requestWaiters.push(resolve));
+    }
+    this.activeRequests++;
+    try {
+      return await run();
+    } finally {
+      this.activeRequests--;
+      this.requestWaiters.shift()?.();
     }
   }
 

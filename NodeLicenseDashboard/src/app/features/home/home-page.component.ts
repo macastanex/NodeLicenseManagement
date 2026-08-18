@@ -1,7 +1,5 @@
-import { Component, OnInit, ViewChild } from '@angular/core';
+import { Component, OnInit } from '@angular/core';
 import { BehaviorSubject } from 'rxjs';
-
-import { NimbleTableDirective } from '@ni/nimble-angular/table';
 
 import { AppViewStateService } from '../../core/state/app-view-state.service';
 import {
@@ -83,15 +81,11 @@ export class HomePageComponent implements OnInit {
   bars: BarColumn[] = [];
   axisTicks: AxisTick[] = [];
   activeFilter = 'total';
-  viewResultUrl: string | null = null;
-  viewResultAvailable = false;
+  enriching = false;
+  hoverSlice: string | null = null;
+  hoverBar: string | null = null;
 
   private allRows: NodeDetailRow[] = [];
-  private selectionToken = 0;
-  private selectedFilter = '';
-  private readonly resultUrlCache = new Map<string, string | null>();
-
-  @ViewChild(NimbleTableDirective) private table?: NimbleTableDirective<NodeDetailRow>;
 
   readonly detailData$ = new BehaviorSubject<NodeDetailRow[]>([]);
 
@@ -110,17 +104,30 @@ export class HomePageComponent implements OnInit {
 
   async reload(): Promise<void> {
     this.state = { ...this.state, isLoading: true, error: null };
+    this.enriching = false;
     try {
       const value = await this.dataService.load();
       this.state = { value, isLoading: false, error: null };
       this.buildCharts(value);
-      this.resultUrlCache.clear();
-      this.allRows = [...value.detail].sort((a, b) => b.lastActiveIso.localeCompare(a.lastActiveIso));
-      this.applyFilter();
+      this.setRows(value.detail);
+      // Stream in Last Active times without blocking the initial render.
+      this.enriching = true;
+      value
+        .enrichLastActive()
+        .then((detail) => this.setRows(detail))
+        .catch(() => undefined)
+        .finally(() => {
+          this.enriching = false;
+        });
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : 'Failed to load node license data.';
       this.state = { ...this.state, isLoading: false, error: message };
     }
+  }
+
+  private setRows(detail: NodeDetailRow[]): void {
+    this.allRows = [...detail].sort((a, b) => b.lastActiveIso.localeCompare(a.lastActiveIso));
+    this.applyFilter();
   }
 
   showTip(event: MouseEvent, text: string, wide = false): void {
@@ -167,90 +174,7 @@ export class HomePageComponent implements OnInit {
     return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`;
   }
 
-  async onRowDoubleClick(): Promise<void> {
-    if (!this.table) {
-      return;
-    }
-    const [rowId] = await this.table.getSelectedRecordIds();
-    const row = this.allRows.find((r) => r.rowId === rowId);
-    if (!row?.resultFilter) {
-      return;
-    }
-    const url = await this.resolveResultUrl(row.resultFilter);
-    if (url) {
-      window.open(url, '_blank');
-    }
-  }
-
-  async onSelectionChange(): Promise<void> {
-    // Guards against stale results when the selection changes mid-query.
-    const token = ++this.selectionToken;
-    this.viewResultUrl = null;
-    this.viewResultAvailable = false;
-    this.selectedFilter = '';
-    if (!this.table) {
-      return;
-    }
-    const [rowId] = await this.table.getSelectedRecordIds();
-    const row = this.allRows.find((r) => r.rowId === rowId);
-    if (!row?.resultFilter) {
-      return;
-    }
-    this.selectedFilter = row.resultFilter;
-
-    // Previously resolved for this host: reuse without another query.
-    if (this.resultUrlCache.has(row.resultFilter)) {
-      const cached = this.resultUrlCache.get(row.resultFilter) ?? null;
-      this.viewResultUrl = cached;
-      this.viewResultAvailable = cached !== null;
-      return;
-    }
-
-    // A result was already observed for this row, so show the button immediately and resolve the
-    // exact URL lazily instead of blocking on a query.
-    if (row.hasResult === 'true') {
-      this.viewResultAvailable = true;
-    }
-
-    const url = await this.dataService.getLatestResultUrl(row.resultFilter);
-    if (token !== this.selectionToken) {
-      return;
-    }
-    this.resultUrlCache.set(row.resultFilter, url);
-    this.viewResultUrl = url;
-    this.viewResultAvailable = url !== null;
-  }
-
-  async viewResult(): Promise<void> {
-    if (this.viewResultUrl) {
-      window.open(this.viewResultUrl, '_blank');
-      return;
-    }
-    if (!this.selectedFilter) {
-      return;
-    }
-    const url = await this.resolveResultUrl(this.selectedFilter);
-    if (url) {
-      window.open(url, '_blank');
-    }
-  }
-
-  private async resolveResultUrl(filter: string): Promise<string | null> {
-    const cached = this.resultUrlCache.get(filter);
-    if (cached !== undefined) {
-      return cached;
-    }
-    const url = await this.dataService.getLatestResultUrl(filter);
-    this.resultUrlCache.set(filter, url);
-    return url;
-  }
-
   private applyFilter(): void {
-    // Selection is cleared when the table data changes, so the View Result button hides.
-    this.viewResultUrl = null;
-    this.viewResultAvailable = false;
-    this.selectedFilter = '';
-    this.selectionToken++;
     const predicate = (row: NodeDetailRow): boolean => {
       switch (this.activeFilter) {
         case 'managed':

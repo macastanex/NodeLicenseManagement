@@ -186,10 +186,20 @@
 }
 
 .dashboard__table {
+  position: relative;
   flex: 1 1 0;
   min-height: 0;
   overflow: hidden;
   display: flex;
+}
+
+.table-spinner {
+  position: absolute;
+  top: 6px;
+  left: 8px;
+  z-index: 5;
+  height: 16px;
+  width: 16px;
 }
 
 .dashboard__table nimble-table {
@@ -213,6 +223,35 @@
   white-space: normal;
   max-width: 320px;
   line-height: 1.35;
+}
+
+.pie__slice,
+.bars__seg {
+  cursor: pointer;
+  // Gap-colored border (page background) to clearly delineate adjacent segments.
+  stroke: var(--app-background);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  transition: opacity 0.12s ease, stroke-width 0.12s ease;
+}
+
+.bars__seg {
+  stroke-width: 1;
+}
+
+.pie__slice--active {
+  stroke: #ffffff;
+  stroke-width: 2;
+}
+
+.bars__seg--active {
+  stroke: #ffffff;
+  stroke-width: 1.5;
+}
+
+.pie__slice--dim,
+.bars__seg--dim {
+  opacity: 0.4;
 }
 
 @media (max-width: 900px) {

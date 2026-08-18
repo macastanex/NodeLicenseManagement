@@ -30,7 +30,7 @@
             "polyfills": ["zone.js", "@angular/localize/init"],
             "tsConfig": "tsconfig.app.json",
             "inlineStyleLanguage": "scss",
-            "assets": ["src/assets"],
+            "assets": ["src/assets", { "glob": "icon.svg", "input": ".", "output": "." }],
             "styles": ["src/styles.scss"],
             "scripts": []
           },

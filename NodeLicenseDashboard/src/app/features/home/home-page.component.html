@@ -5,13 +5,16 @@
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
-      stroke-width="2"
+      stroke-width="1.8"
       stroke-linecap="round"
       stroke-linejoin="round"
       aria-hidden="true"
     >
-      <rect x="2" y="3" width="20" height="13" rx="1.5"></rect>
-      <path d="M8 21h8M12 16v5M8.5 9.5l2.5 2.5 4-4.5"></path>
+      <rect x="5" y="2" width="14" height="13" rx="1.5"></rect>
+      <path d="M8 6h8M8 9h8M8 12h4"></path>
+      <circle cx="12" cy="16.4" r="3.3"></circle>
+      <path d="M10.5 16.4l1 1 1.9-2.1"></path>
+      <path d="M10.3 19.2 9.5 22.3 12 20.9 14.5 22.3 13.7 19.2"></path>
     </svg>
     <div class="app-header__text">
       <h1 class="app-header__title">Node License Management</h1>
@@ -20,7 +23,6 @@
       </p>
     </div>
     <div class="app-header__actions">
-      <nimble-button *ngIf="viewResultAvailable" appearance="outline" (click)="viewResult()">View Result</nimble-button>
       <nimble-button appearance="outline" (click)="exportCsv()">Export CSV</nimble-button>
       <nimble-button appearance="outline" (click)="reload()">Refresh</nimble-button>
     </div>
@@ -53,11 +55,14 @@
           <svg viewBox="0 0 220 220" class="pie" role="img" aria-label="Managed versus unmanaged node share">
             <g *ngFor="let slice of pieSlices">
               <path
+                class="pie__slice"
+                [class.pie__slice--active]="hoverSlice === slice.label"
+                [class.pie__slice--dim]="hoverSlice && hoverSlice !== slice.label"
                 [attr.d]="slice.path"
                 [attr.fill]="slice.color"
-                (mouseenter)="showTip($event, slice.label + ': ' + slice.count)"
+                (mouseenter)="hoverSlice = slice.label; showTip($event, slice.label + ': ' + slice.count)"
                 (mousemove)="showTip($event, slice.label + ': ' + slice.count)"
-                (mouseleave)="hideTip()"
+                (mouseleave)="hoverSlice = null; hideTip()"
               ></path>
               <text
                 [attr.x]="slice.labelX"
@@ -96,24 +101,30 @@
             </g>
             <g *ngFor="let bar of bars">
               <rect
+                class="bars__seg"
+                [class.bars__seg--active]="hoverBar === bar.month + '|u'"
+                [class.bars__seg--dim]="hoverBar && hoverBar !== bar.month + '|u'"
                 [attr.x]="bar.x"
                 [attr.y]="bar.unmanagedY"
                 [attr.width]="bar.barWidth"
                 [attr.height]="bar.unmanagedHeight"
                 [attr.fill]="unmanagedColor"
-                (mouseenter)="showTip($event, bar.month + ' · Unmanaged: ' + bar.unmanaged)"
+                (mouseenter)="hoverBar = bar.month + '|u'; showTip($event, bar.month + ' · Unmanaged: ' + bar.unmanaged)"
                 (mousemove)="showTip($event, bar.month + ' · Unmanaged: ' + bar.unmanaged)"
-                (mouseleave)="hideTip()"
+                (mouseleave)="hoverBar = null; hideTip()"
               ></rect>
               <rect
+                class="bars__seg"
+                [class.bars__seg--active]="hoverBar === bar.month + '|m'"
+                [class.bars__seg--dim]="hoverBar && hoverBar !== bar.month + '|m'"
                 [attr.x]="bar.x"
                 [attr.y]="bar.managedY"
                 [attr.width]="bar.barWidth"
                 [attr.height]="bar.managedHeight"
                 [attr.fill]="managedColor"
-                (mouseenter)="showTip($event, bar.month + ' · Managed: ' + bar.managed)"
+                (mouseenter)="hoverBar = bar.month + '|m'; showTip($event, bar.month + ' · Managed: ' + bar.managed)"
                 (mousemove)="showTip($event, bar.month + ' · Managed: ' + bar.managed)"
-                (mouseleave)="hideTip()"
+                (mouseleave)="hoverBar = null; hideTip()"
               ></rect>
               <text
                 *ngIf="bar.unmanagedHeight > 14"
@@ -160,12 +171,10 @@
     </section>
 
     <section class="dashboard__table">
+      <nimble-spinner class="table-spinner" *ngIf="enriching" title="Updating results…"></nimble-spinner>
       <nimble-table
         id-field-name="rowId"
         [data$]="detailData$"
-        selection-mode="single"
-        (dblclick)="onRowDoubleClick()"
-        (selection-change)="onSelectionChange()"
         style="--ni-nimble-fail-color: #5b9bd5;"
       >
         <nimble-table-column-anchor
@@ -173,7 +182,10 @@
           href-field-name="systemUrl"
           target="_blank"
           placeholder="&mdash;"
+          appearance="prominent"
           underline-hidden
+          fractional-width="2.5"
+          min-pixel-width="340"
         >
           Minion ID
         </nimble-table-column-anchor>
@@ -216,6 +228,16 @@
         </nimble-table-column-mapping>
         <nimble-table-column-text field-name="registered">Registered</nimble-table-column-text>
         <nimble-table-column-text field-name="lastActive">Last Active</nimble-table-column-text>
+        <nimble-table-column-anchor
+          label-field-name="resultLabel"
+          href-field-name="resultUrl"
+          target="_blank"
+          placeholder="&mdash;"
+          appearance="prominent"
+          underline-hidden
+        >
+          Result
+        </nimble-table-column-anchor>
       </nimble-table>
     </section>
   </ng-container>
