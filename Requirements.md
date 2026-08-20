@@ -20,7 +20,7 @@
 | Asset Type | Web App |
 | Approach | Build New |
 | Existing Asset or Example, if applicable | Ports the logic of the internal `NodeLicenseCount.ipynb` analysis notebook |
-| Epic | _TBD_ |
+| Epic | https://dev.azure.com/ni/DevCentral/_workitems/edit/3839516 |
 | Business Owner | Moyer |
 | Technical Owner | Michael Castaneda |
 | Reviewer(s) | _TBD_ |
