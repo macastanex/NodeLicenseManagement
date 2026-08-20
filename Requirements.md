@@ -137,7 +137,7 @@ Deployment-time only (published as a hosted web app). No end-user configuration 
 - Enforcing, allocating, or reclaiming licenses; the app reports consumption, it does not change entitlements.
 - Continuous/automated background monitoring, alerting, notifications, or paging.
 - Persisting or storing node counts over time beyond the on-the-fly 12-month trend (no historical database).
-- Per-node inventory beyond what Systems Management and Test Monitor expose (no deep hardware/software inventory).
+- Per-node inventory beyond what Systems Management and Test Monitor expose.
 - Root-cause analysis or automated remediation of stale/unmanaged nodes.
 - Authentication/identity management (the app relies on the host session and same-origin routing).
 - Cross-origin or multi-deployment aggregation from a single instance.
